@@ -1,0 +1,802 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<title>Выживание — кооп</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #1a2117; overflow: hidden;
+               touch-action: none; -webkit-user-select: none; user-select: none;
+               -webkit-touch-callout: none; font-family: -apple-system, 'Segoe UI', Roboto, sans-serif; }
+  #game { width: 100%; height: 100%; }
+  canvas { display: block; }
+
+  #lobby { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center;
+           background: radial-gradient(ellipse at 50% 30%, #2d4426 0%, #1a2117 70%); z-index: 10; padding: 20px; box-sizing: border-box; }
+  .card { width: 100%; max-width: 340px; text-align: center; color: #fff6e0; }
+  .card h1 { margin: 0 0 6px; font-size: 30px; letter-spacing: 0.5px; }
+  .card .sub { margin: 0 0 28px; color: #c9d4b8; font-size: 15px; }
+  .card button { width: 100%; padding: 15px; border: 0; border-radius: 12px; font-size: 18px; font-weight: 700;
+                 background: #e8a33d; color: #2a1c05; touch-action: manipulation; }
+  .card button:disabled { opacity: 0.5; }
+  .card button.alt { background: #34502c; color: #fff6e0; border: 2px solid #5c8a4d; }
+  .or { margin: 22px 0 10px; color: #c9d4b8; font-size: 14px; }
+  .card input { width: 100%; box-sizing: border-box; padding: 14px; margin-bottom: 10px; border-radius: 12px;
+                border: 2px solid #5c8a4d; background: #121a10; color: #fff6e0; font-size: 22px;
+                text-align: center; letter-spacing: 6px; text-transform: uppercase; outline: none;
+                -webkit-user-select: text; user-select: text; }
+  #status { min-height: 20px; margin-top: 16px; color: #ffd98a; font-size: 14px; line-height: 1.35; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/phaser/3.80.1/phaser.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+</head>
+<body>
+<div id="game"></div>
+
+<div id="lobby">
+  <div class="card">
+    <h1>Выживание</h1>
+    <p class="sub">Кооп на двоих через интернет</p>
+    <button id="btnHost">Создать игру</button>
+    <div class="or">или войти к другу по коду</div>
+    <input id="codeIn" maxlength="5" placeholder="КОД" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false">
+    <button id="btnJoin" class="alt">Войти</button>
+    <div id="status"></div>
+  </div>
+</div>
+
+<script>
+// ====== НАСТРОЙКИ ======
+const WORLD = 2400;
+const SPEED = 190;
+const HIT_COOLDOWN = 380;
+const REACH = 56;
+const RESPAWN_MS = 12000;
+const SEND_EVERY = 50;
+const PREFIX = 'lde-surv-';
+
+// tex — список вариантов картинки (выбирается по id), sway — сила покачивания в градусах,
+// body — хитбокс [ширина, высота, смещение x, смещение y]
+const TYPES = {
+  tree: { tex: ['tree1', 'tree2'], hp: 4, res: 'wood',  label: 'дерево', count: 55, sway: 1.1, body: [20, 12, 18, 62] },
+  rock: { tex: ['rock1', 'rock2'], hp: 5, res: 'stone', label: 'камень', count: 30, sway: 0,   body: [38, 20, 5, 14] },
+  bush: { tex: ['bush1'],          hp: 3, res: 'food',  label: 'ягоды',  count: 25, sway: 0.7, body: [30, 16, 7, 16] }
+};
+
+// ====== СЕТЬ (peer-to-peer через PeerJS) ======
+const NET = { mode: null, peer: null, conn: null, code: '', started: false,
+              init: null, queue: [], onMsg: null, onJoin: null, onLeave: null, onError: null };
+
+const $ = (id) => document.getElementById(id);
+function setStatus(text, busy) {
+  $('status').textContent = text;
+  $('btnHost').disabled = !!busy;
+  $('btnJoin').disabled = !!busy;
+}
+function makeCode() {
+  const a = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let s = '';
+  for (let i = 0; i < 5; i++) s += a[Math.floor(Math.random() * a.length)];
+  return s;
+}
+function send(msg) {
+  if (NET.conn && NET.conn.open) NET.conn.send(msg);
+}
+function dispatch(d) {
+  if (NET.onMsg) NET.onMsg(d); else NET.queue.push(d);
+}
+
+function hostGame(attempt) {
+  attempt = attempt || 0;
+  if (typeof Peer === 'undefined') { setStatus('Не загрузилась сетевая библиотека. Проверь интернет и обнови страницу.', false); return; }
+  setStatus('Создаю комнату…', true);
+  const code = makeCode();
+  const peer = new Peer(PREFIX + code);
+
+  peer.on('open', () => {
+    NET.mode = 'host'; NET.peer = peer; NET.code = code;
+    startGame();
+  });
+  peer.on('error', (err) => {
+    if (NET.started) { if (NET.onError) NET.onError(err); return; }
+    if (err.type === 'unavailable-id' && attempt < 5) { peer.destroy(); hostGame(attempt + 1); return; }
+    setStatus('Не получилось создать игру (' + err.type + '). Попробуй ещё раз.', false);
+  });
+  peer.on('connection', (conn) => {
+    if (NET.conn && NET.conn.open) { conn.on('open', () => conn.close()); return; }
+    NET.conn = conn;
+    conn.on('open', () => { if (NET.onJoin) NET.onJoin(); });
+    conn.on('data', dispatch);
+    conn.on('close', () => { NET.conn = null; if (NET.onLeave) NET.onLeave(); });
+  });
+}
+
+function joinGame() {
+  const code = $('codeIn').value.trim().toUpperCase();
+  if (code.length < 5) { setStatus('Введи код из 5 символов.', false); return; }
+  if (typeof Peer === 'undefined') { setStatus('Не загрузилась сетевая библиотека. Проверь интернет и обнови страницу.', false); return; }
+  setStatus('Подключаюсь…', true);
+
+  const peer = new Peer();
+  let timer = null;
+  peer.on('open', () => {
+    const conn = peer.connect(PREFIX + code, { reliable: true });
+    timer = setTimeout(() => {
+      if (NET.started) return;
+      setStatus('Не получилось соединиться. Проверь код и что друг уже создал игру. Иногда помогает сменить Wi-Fi на мобильный интернет или наоборот.', false);
+      peer.destroy();
+    }, 15000);
+    conn.on('open', () => { NET.conn = conn; NET.peer = peer; NET.mode = 'client'; NET.code = code; });
+    conn.on('data', (d) => {
+      if (d.t === 'init' && !NET.started) { clearTimeout(timer); NET.init = d; startGame(); }
+      else dispatch(d);
+    });
+    conn.on('close', () => {
+      if (NET.onLeave) NET.onLeave(); else setStatus('Друг закрыл игру.', false);
+    });
+  });
+  peer.on('error', (err) => {
+    if (NET.started) { if (NET.onError) NET.onError(err); return; }
+    clearTimeout(timer);
+    setStatus(err.type === 'peer-unavailable' ? 'Игра с таким кодом не найдена.' : 'Ошибка сети (' + err.type + ').', false);
+  });
+}
+
+$('btnHost').addEventListener('click', () => hostGame(0));
+$('btnJoin').addEventListener('click', joinGame);
+
+// ====== РИСОВАНИЕ КАРТИНОК (canvas с градиентами = «объём») ======
+// Источник света — сверху-слева: блики слева-сверху, тени падают вправо-вниз.
+
+// шар с бликом
+function sphere(ctx, cx, cy, r, c) {
+  const g = ctx.createRadialGradient(cx - r * 0.35, cy - r * 0.4, r * 0.08, cx, cy, r);
+  g.addColorStop(0, c[0]); g.addColorStop(0.55, c[1]); g.addColorStop(1, c[2]);
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
+}
+// мягкая тень-эллипс
+function softShadow(ctx, cx, cy, rx, ry, alpha) {
+  ctx.save();
+  ctx.translate(cx, cy); ctx.scale(1, ry / rx);
+  const g = ctx.createRadialGradient(0, 0, 0, 0, 0, rx);
+  g.addColorStop(0, 'rgba(0,0,0,' + alpha + ')');
+  g.addColorStop(0.6, 'rgba(0,0,0,' + (alpha * 0.6) + ')');
+  g.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = g;
+  ctx.beginPath(); ctx.arc(0, 0, rx, 0, Math.PI * 2); ctx.fill();
+  ctx.restore();
+}
+function poly(ctx, pts, fill) {
+  ctx.fillStyle = fill;
+  ctx.beginPath(); ctx.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i][0], pts[i][1]);
+  ctx.closePath(); ctx.fill();
+}
+function rnd(a, b) { return a + Math.random() * (b - a); }
+
+class Main extends Phaser.Scene {
+  constructor() { super('main'); }
+
+  create() {
+    this.makeTextures();
+    this.isClient = NET.mode === 'client';
+
+    this.add.tileSprite(0, 0, WORLD, WORLD, 'grass').setOrigin(0).setDepth(-10000);
+    this.decorate();
+    this.physics.world.setBounds(0, 0, WORLD, WORLD);
+
+    // Игрок (клиент появляется чуть в стороне, чтобы не совпасть с хостом)
+    const off = this.isClient ? 40 : 0;
+    this.player = this.physics.add.sprite(WORLD / 2 + off, WORLD / 2 + off, 'player');
+    this.player.setCollideWorldBounds(true);
+    this.player.body.setSize(18, 12).setOffset(9, 30);
+    this.pShadow = this.add.image(0, 0, 'shadow');
+
+    // Ресурсы
+    this.solids = this.physics.add.group({ immovable: true, allowGravity: false });
+    this.res = {};
+    this.nextId = 1;
+    if (this.isClient) {
+      NET.init.res.forEach((r) => this.spawnAt(r.type, r.x, r.y, r.id, r.hp));
+    } else {
+      for (const type in TYPES) for (let i = 0; i < TYPES[type].count; i++) this.hostSpawnRandom(type);
+    }
+    this.physics.add.collider(this.player, this.solids);
+
+    this.cameras.main.setBounds(0, 0, WORLD, WORLD);
+    this.cameras.main.startFollow(this.player, true, 0.15, 0.15);
+
+    this.inv = { wood: 0, stone: 0, food: 0 };
+    this.friendInv = { wood: 0, stone: 0, food: 0 };
+    this.target = null;
+    this.nextHit = 0;
+    this.nextSend = 0;
+    this.actionHeld = false;
+    this.remote = null;
+    this.lost = false;
+
+    this.setupControls();
+    this.ring = this.add.graphics().setDepth(1);
+    this.buildUi();
+
+    this.layout();
+    this.scale.on('resize', this.layout, this);
+    this.refreshHud();
+    this.refreshNetHud();
+
+    NET.onMsg = (d) => this.handle(d);
+    NET.onJoin = () => this.onFriendJoin();
+    NET.onLeave = () => this.onFriendLeave();
+    NET.onError = (err) => this.toast('Ошибка сети: ' + err.type);
+    NET.queue.splice(0).forEach((d) => this.handle(d));
+    if (!this.isClient && NET.conn && NET.conn.open) this.onFriendJoin();
+  }
+
+  // ----- интерфейс -----
+  buildUi() {
+    // тёмные края экрана (виньетка) — добавляет глубины
+    this.vig = this.add.image(0, 0, 'vig').setOrigin(0).setScrollFactor(0).setDepth(99990);
+
+    // панель ресурсов
+    this.hudPanel = this.add.graphics().setScrollFactor(0).setDepth(99999);
+    this.hudPanel.fillStyle(0x0b120a, 0.45).fillRoundedRect(10, 10, 132, 98, 14);
+    this.hudPanel.lineStyle(2, 0xffffff, 0.12).strokeRoundedRect(10, 10, 132, 98, 14);
+    const icons = ['ic_wood', 'ic_stone', 'ic_food'];
+    this.hudTxt = [];
+    icons.forEach((ic, i) => {
+      this.add.image(34, 36 + i * 30, ic).setScrollFactor(0).setDepth(100000);
+      this.hudTxt.push(this.add.text(58, 24 + i * 30, '0', {
+        fontFamily: 'sans-serif', fontSize: '21px', fontStyle: 'bold',
+        color: '#fff6e0', stroke: '#1a2117', strokeThickness: 4
+      }).setScrollFactor(0).setDepth(100000));
+    });
+
+    this.netTxt = this.add.text(0, 0, '', {
+      fontFamily: 'sans-serif', fontSize: '15px', fontStyle: 'bold', align: 'right',
+      color: '#ffe9a8', stroke: '#1a2117', strokeThickness: 4, lineSpacing: 3
+    }).setOrigin(1, 0).setScrollFactor(0).setDepth(100000);
+    this.hint = this.add.text(0, 0,
+      'Ходьба: WASD / стрелки или джойстик слева\nДобыча: Пробел / E или кнопка справа',
+      { fontFamily: 'sans-serif', fontSize: '15px', color: '#fff6e0', align: 'center',
+        stroke: '#1a2117', strokeThickness: 4 }
+    ).setOrigin(0.5, 1).setScrollFactor(0).setDepth(100000);
+    this.tweens.add({ targets: this.hint, alpha: 0, delay: 10000, duration: 1500 });
+    this.toastTxt = this.add.text(0, 0, '', {
+      fontFamily: 'sans-serif', fontSize: '18px', fontStyle: 'bold', color: '#fff6e0',
+      stroke: '#1a2117', strokeThickness: 5, align: 'center'
+    }).setOrigin(0.5, 0).setScrollFactor(0).setDepth(100002).setAlpha(0);
+  }
+
+  setupControls() {
+    this.keys = this.input.keyboard.addKeys('W,A,S,D,E,SPACE,UP,DOWN,LEFT,RIGHT');
+    this.input.addPointer(2);
+    this.stick = { active: false, id: null, ox: 0, oy: 0, dx: 0, dy: 0 };
+    this.stickBase = this.add.circle(0, 0, 60, 0xffffff, 0.10)
+      .setStrokeStyle(2, 0xffffff, 0.35).setScrollFactor(0).setDepth(100000).setVisible(false);
+    this.stickKnob = this.add.circle(0, 0, 28, 0xffffff, 0.35)
+      .setScrollFactor(0).setDepth(100001).setVisible(false);
+
+    this.btn = this.add.circle(0, 0, 46, 0xe8a33d, 0.55)
+      .setStrokeStyle(3, 0xffe2a8, 0.9).setScrollFactor(0).setDepth(100000).setInteractive();
+    this.btnTxt = this.add.text(0, 0, 'ДОБЫТЬ', { fontFamily: 'sans-serif', fontSize: '13px', fontStyle: 'bold', color: '#fff6e0' })
+      .setOrigin(0.5).setScrollFactor(0).setDepth(100001);
+    this.btn.on('pointerdown', () => { this.actionHeld = true; this.btn.setFillStyle(0xe8a33d, 0.85); });
+    const release = () => { this.actionHeld = false; this.btn.setFillStyle(0xe8a33d, 0.55); };
+    this.btn.on('pointerup', release);
+    this.btn.on('pointerout', release);
+
+    this.input.on('pointerdown', (p, over) => {
+      if (this.stick.active || (over && over.length)) return;
+      if (p.x > this.scale.width * 0.65) return;
+      this.stick.active = true; this.stick.id = p.id;
+      this.stick.ox = p.x; this.stick.oy = p.y;
+      this.stickBase.setPosition(p.x, p.y).setVisible(true);
+      this.stickKnob.setPosition(p.x, p.y).setVisible(true);
+    });
+    this.input.on('pointermove', (p) => {
+      if (!this.stick.active || p.id !== this.stick.id) return;
+      let dx = p.x - this.stick.ox, dy = p.y - this.stick.oy;
+      const len = Math.hypot(dx, dy), max = 60;
+      if (len > max) { dx = dx / len * max; dy = dy / len * max; }
+      this.stickKnob.setPosition(this.stick.ox + dx, this.stick.oy + dy);
+      this.stick.dx = dx / max; this.stick.dy = dy / max;
+    });
+    this.input.on('pointerup', (p) => {
+      if (!this.stick.active || p.id !== this.stick.id) return;
+      this.stick.active = false; this.stick.dx = 0; this.stick.dy = 0;
+      this.stickBase.setVisible(false); this.stickKnob.setVisible(false);
+    });
+  }
+
+  layout() {
+    const w = this.scale.width, h = this.scale.height;
+    this.btn.setPosition(w - 80, h - 105);
+    this.btnTxt.setPosition(w - 80, h - 105);
+    this.netTxt.setPosition(w - 16, 14);
+    this.hint.setPosition(w / 2, h - 16).setWordWrapWidth(w - 40);
+    this.toastTxt.setPosition(w / 2, 70).setWordWrapWidth(w - 40);
+    this.vig.setDisplaySize(w, h);
+  }
+
+  refreshHud() {
+    this.hudTxt[0].setText(String(this.inv.wood));
+    this.hudTxt[1].setText(String(this.inv.stone));
+    this.hudTxt[2].setText(String(this.inv.food));
+  }
+
+  refreshNetHud() {
+    let t;
+    if (this.lost) t = 'Связь потеряна\nОбнови страницу';
+    else if (this.isClient) t = 'Код: ' + NET.code + '\nты в игре друга';
+    else if (this.remote || (NET.conn && NET.conn.open)) t = 'Код: ' + NET.code + '\nдруг в игре';
+    else t = 'Код: ' + NET.code + '\nждём друга…';
+    this.netTxt.setText(t);
+  }
+
+  toast(str) {
+    this.toastTxt.setText(str).setAlpha(1);
+    this.tweens.killTweensOf(this.toastTxt);
+    this.tweens.add({ targets: this.toastTxt, alpha: 0, delay: 2500, duration: 600 });
+  }
+
+  // ----- украшение земли: пятна, трава, цветы -----
+  decorate() {
+    const R = Phaser.Math.Between, F = Phaser.Math.FloatBetween;
+    const patchTints = [0x2b4a20, 0x2b4a20, 0x7cab46, 0x6e5a38];
+    for (let i = 0; i < 150; i++) {
+      this.add.image(R(0, WORLD), R(0, WORLD), 'patch')
+        .setTint(Phaser.Utils.Array.GetRandom(patchTints))
+        .setAlpha(F(0.18, 0.4)).setScale(F(0.8, 2.2)).setDepth(-9995);
+    }
+    for (let i = 0; i < 260; i++) {
+      this.add.image(R(0, WORLD), R(0, WORLD), 'tuft')
+        .setScale(F(0.8, 1.3)).setFlipX(Math.random() < 0.5).setDepth(-9990);
+    }
+    const flowerTints = [0xffd84a, 0xff8fb0, 0xffffff, 0x9fc4ff];
+    for (let i = 0; i < 90; i++) {
+      this.add.image(R(0, WORLD), R(0, WORLD), 'flower')
+        .setTint(Phaser.Utils.Array.GetRandom(flowerTints)).setDepth(-9989);
+    }
+  }
+
+  // ----- ресурсы -----
+  spawnAt(type, x, y, id, hp) {
+    const cfg = TYPES[type];
+    const tex = cfg.tex[id % cfg.tex.length];
+    const s = this.solids.create(x, y, tex);
+    s.setImmovable(true);
+    s.body.setSize(cfg.body[0], cfg.body[1]).setOffset(cfg.body[2], cfg.body[3]);
+    s.setDepth(s.y + s.height / 2);
+    s.setData('type', type);
+    s.setData('hp', hp);
+    s.setData('id', id);
+    s.setData('ph', Math.random());
+    s.setData('shake', 0);
+    this.res[id] = s;
+    return s;
+  }
+
+  hostSpawnRandom(type) {
+    let x, y, tries = 0;
+    do {
+      x = Phaser.Math.Between(80, WORLD - 80);
+      y = Phaser.Math.Between(80, WORLD - 80);
+      tries++;
+    } while ((Phaser.Math.Distance.Between(x, y, WORLD / 2, WORLD / 2) < 140 || this.tooClose(x, y)) && tries < 40);
+    const id = this.nextId++;
+    const hp = TYPES[type].hp;
+    this.spawnAt(type, x, y, id, hp);
+    send({ t: 'add', type: type, x: x, y: y, id: id, hp: hp });
+  }
+
+  tooClose(x, y) {
+    let close = false;
+    this.solids.children.iterate((s) => {
+      if (s && Phaser.Math.Distance.Between(x, y, s.x, s.y) < 64) close = true;
+    });
+    return close;
+  }
+
+  removeRes(id) {
+    const s = this.res[id];
+    if (!s) return;
+    if (this.target === s) this.target = null;
+    s.destroy();
+    delete this.res[id];
+  }
+
+  // ----- эффекты -----
+  shake(s) { s.setData('shake', 4); }
+
+  burst(x, y, type) {
+    const cols = type === 'tree' ? [0x8a5a2b, 0x58a04a, 0x6b4423]
+               : type === 'rock' ? [0xaab2bb, 0x7d8590, 0xd0d6dc]
+               : [0xd3303f, 0x3f8a38, 0xff7a82];
+    for (let i = 0; i < 7; i++) {
+      const c = this.add.circle(x, y, Phaser.Math.Between(2, 3), Phaser.Utils.Array.GetRandom(cols)).setDepth(200000);
+      const a = Phaser.Math.FloatBetween(-Math.PI, 0), v = Phaser.Math.Between(20, 48);
+      this.tweens.add({
+        targets: c,
+        x: x + Math.cos(a) * v,
+        y: y + Math.sin(a) * v + Phaser.Math.Between(14, 26),
+        alpha: 0, duration: Phaser.Math.Between(350, 560), ease: 'Quad.easeOut',
+        onComplete: () => c.destroy()
+      });
+    }
+  }
+
+  floatText(x, y, str) {
+    const txt = this.add.text(x, y, str, {
+      fontFamily: 'sans-serif', fontSize: '16px', fontStyle: 'bold',
+      color: '#ffe9a8', stroke: '#1a2117', strokeThickness: 4
+    }).setOrigin(0.5).setDepth(200000);
+    this.tweens.add({ targets: txt, y: y - 34, alpha: 0, duration: 800, onComplete: () => txt.destroy() });
+  }
+
+  // ----- удары -----
+  hit() {
+    const t = this.target;
+    if (!t || !t.active) return;
+    this.player.setFlipX(t.x < this.player.x);
+    this.tweens.add({ targets: this.player, scaleX: 1.12, scaleY: 0.9, duration: 70, yoyo: true });
+    this.shake(t);
+    this.burst(t.x, t.y, t.getData('type'));
+    const id = t.getData('id');
+    if (this.isClient) send({ t: 'hit', id: id });
+    else this.applyHit(id, 'host');
+  }
+
+  // только хост: применяет удар (свой или друга)
+  applyHit(id, who) {
+    const s = this.res[id];
+    if (!s || !s.active) return;
+    if (who === 'friend' && this.remote) {
+      const d = Phaser.Math.Distance.Between(this.rtx, this.rty + 10, s.x, s.y + s.height / 2 - 8);
+      if (d > REACH * 2.5) return;
+    }
+    const type = s.getData('type'), cfg = TYPES[type];
+    const hp = s.getData('hp') - 1;
+    const inv = who === 'host' ? this.inv : this.friendInv;
+    inv[cfg.res] += 1;
+
+    const fx = s.x, fy = s.y - s.height / 2;
+    if (who === 'host') {
+      this.refreshHud();
+      this.floatText(fx, fy, '+1 ' + cfg.label);
+    } else {
+      this.shake(s);
+      this.burst(s.x, s.y, type);
+      send({ t: 'gain', label: cfg.label, x: fx, y: fy, inv: this.friendInv });
+    }
+
+    if (hp <= 0) {
+      this.removeRes(id);
+      send({ t: 'del', id: id, by: who });
+      this.time.delayedCall(RESPAWN_MS, () => this.hostSpawnRandom(type));
+    } else {
+      s.setData('hp', hp);
+      send({ t: 'hp', id: id, by: who });
+    }
+  }
+
+  // ----- сообщения по сети -----
+  handle(d) {
+    switch (d.t) {
+      case 'pos': this.onRemotePos(d); break;
+      case 'hit': if (!this.isClient) this.applyHit(d.id, 'friend'); break;
+      case 'hp': {
+        const s = this.res[d.id];
+        if (s && d.by !== 'friend') { this.shake(s); this.burst(s.x, s.y, s.getData('type')); }
+        break;
+      }
+      case 'del': {
+        const s = this.res[d.id];
+        if (s && d.by !== 'friend') this.burst(s.x, s.y, s.getData('type'));
+        this.removeRes(d.id);
+        break;
+      }
+      case 'add': this.spawnAt(d.type, d.x, d.y, d.id, d.hp); break;
+      case 'gain':
+        this.inv = d.inv; this.refreshHud();
+        this.floatText(d.x, d.y, '+1 ' + d.label);
+        break;
+    }
+  }
+
+  onFriendJoin() {
+    this.friendInv = { wood: 0, stone: 0, food: 0 };
+    const list = Object.keys(this.res).map((k) => {
+      const s = this.res[k];
+      return { id: s.getData('id'), type: s.getData('type'), x: Math.round(s.x), y: Math.round(s.y), hp: s.getData('hp') };
+    });
+    send({ t: 'init', res: list });
+    this.toast('Друг подключился!');
+    this.refreshNetHud();
+  }
+
+  onFriendLeave() {
+    if (this.remote) { this.remote.destroy(); this.rlabel.destroy(); this.rShadow.destroy(); this.remote = null; }
+    if (this.isClient) { this.lost = true; this.toast('Связь с другом потеряна'); }
+    else this.toast('Друг вышел');
+    this.refreshNetHud();
+  }
+
+  onRemotePos(d) {
+    if (!this.remote) {
+      this.rShadow = this.add.image(d.x, d.y, 'shadow');
+      this.remote = this.add.sprite(d.x, d.y, 'player2');
+      this.rlabel = this.add.text(d.x, d.y, 'Друг', {
+        fontFamily: 'sans-serif', fontSize: '13px', fontStyle: 'bold', color: '#ffd9b0',
+        stroke: '#1a2117', strokeThickness: 3
+      }).setOrigin(0.5, 1).setDepth(200000);
+      this.refreshNetHud();
+    }
+    this.rtx = d.x; this.rty = d.y;
+    this.remote.setFlipX(!!d.f);
+  }
+
+  // ----- каждый кадр -----
+  update(time, delta) {
+    const K = this.keys;
+    let vx = 0, vy = 0;
+    if (K.A.isDown || K.LEFT.isDown)  vx -= 1;
+    if (K.D.isDown || K.RIGHT.isDown) vx += 1;
+    if (K.W.isDown || K.UP.isDown)    vy -= 1;
+    if (K.S.isDown || K.DOWN.isDown)  vy += 1;
+    if (this.stick.active) { vx = this.stick.dx; vy = this.stick.dy; }
+
+    const len = Math.hypot(vx, vy);
+    if (len > 1) { vx /= len; vy /= len; }
+    this.player.setVelocity(vx * SPEED, vy * SPEED);
+    if (vx < -0.1) this.player.setFlipX(true);
+    else if (vx > 0.1) this.player.setFlipX(false);
+
+    // «шагающая» покачка и тень
+    this.player.angle = len > 0.08 ? Math.sin(time / 80) * 5 : this.player.angle * 0.7;
+    this.player.setDepth(this.player.y + 18);
+    this.pShadow.setPosition(this.player.x + 3, this.player.y + 18).setDepth(this.player.depth - 1);
+
+    // отправляем свою позицию
+    if (NET.conn && NET.conn.open && time > this.nextSend) {
+      this.nextSend = time + SEND_EVERY;
+      send({ t: 'pos', x: Math.round(this.player.x), y: Math.round(this.player.y), f: this.player.flipX ? 1 : 0 });
+    }
+
+    // плавно двигаем друга
+    if (this.remote) {
+      const dx = this.rtx - this.remote.x, dy = this.rty - this.remote.y;
+      this.remote.x += dx * 0.35;
+      this.remote.y += dy * 0.35;
+      this.remote.angle = (Math.abs(dx) > 0.8 || Math.abs(dy) > 0.8) ? Math.sin(time / 80) * 5 : this.remote.angle * 0.7;
+      this.remote.setDepth(this.remote.y + 18);
+      this.rShadow.setPosition(this.remote.x + 3, this.remote.y + 18).setDepth(this.remote.depth - 1);
+      this.rlabel.setPosition(this.remote.x, this.remote.y - 26);
+    }
+
+    // ресурсы: покачивание, тряска при ударе, поиск ближайшего
+    let best = null, bestDist = REACH;
+    const pc = this.player.body.center;
+    this.solids.children.iterate((s) => {
+      if (!s || !s.active) return;
+      const cfg = TYPES[s.getData('type')];
+      const ph = s.getData('ph');
+      let a = cfg.sway ? Math.sin(time / (700 + ph * 60) + ph * 6) * cfg.sway : 0;
+      const sh = s.getData('shake');
+      if (sh > 0) {
+        a += Math.sin(time / 22) * sh;
+        s.setData('shake', Math.max(0, sh - delta * 0.016));
+      }
+      s.angle = a;
+
+      const d = Phaser.Math.Distance.Between(pc.x, pc.y, s.body.center.x, s.body.center.y);
+      if (d < bestDist) { bestDist = d; best = s; }
+    });
+    this.target = best;
+
+    this.ring.clear();
+    if (best) {
+      this.ring.lineStyle(2, 0xffeb7a, 0.9)
+        .strokeEllipse(best.body.center.x, best.body.center.y + 4, best.body.width + 16, best.body.height + 10);
+    }
+
+    const want = K.SPACE.isDown || K.E.isDown || this.actionHeld;
+    if (want && time > this.nextHit && !this.lost) {
+      this.nextHit = time + HIT_COOLDOWN;
+      this.hit();
+    }
+  }
+
+  // ----- генерация всех картинок -----
+  mk(key, w, h, draw) {
+    const t = this.textures.createCanvas(key, w, h);
+    draw(t.getContext(), w, h);
+    t.refresh();
+  }
+
+  makeTextures() {
+    // Земля: бесшовная плитка 128x128 с мягкими пятнами и крапинкой
+    this.mk('grass', 128, 128, (ctx) => {
+      ctx.fillStyle = '#3f6430'; ctx.fillRect(0, 0, 128, 128);
+      const blot = (x, y, r, rgb, a) => {
+        for (const ox of [-128, 0, 128]) for (const oy of [-128, 0, 128]) {
+          const g = ctx.createRadialGradient(x + ox, y + oy, 0, x + ox, y + oy, r);
+          g.addColorStop(0, 'rgba(' + rgb + ',' + a + ')');
+          g.addColorStop(1, 'rgba(' + rgb + ',0)');
+          ctx.fillStyle = g;
+          ctx.fillRect(x + ox - r, y + oy - r, r * 2, r * 2);
+        }
+      };
+      for (let i = 0; i < 12; i++) blot(rnd(0, 128), rnd(0, 128), rnd(18, 34), '112,170,70', rnd(0.10, 0.2));
+      for (let i = 0; i < 12; i++) blot(rnd(0, 128), rnd(0, 128), rnd(18, 34), '20,50,20', rnd(0.10, 0.2));
+      for (let i = 0; i < 110; i++) {
+        ctx.fillStyle = Math.random() < 0.5 ? 'rgba(130,190,80,0.35)' : 'rgba(20,45,20,0.35)';
+        ctx.fillRect(Math.floor(rnd(1, 125)), Math.floor(rnd(1, 125)), 2, 2);
+      }
+    });
+
+    // Мягкое пятно (окрашивается tint-ом)
+    this.mk('patch', 128, 128, (ctx) => {
+      const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+      g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(1, 'rgba(255,255,255,0)');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, 128, 128);
+    });
+
+    // Пучок травы
+    this.mk('tuft', 16, 14, (ctx) => {
+      const blades = [[3, 13, 1, 4], [6, 13, 5, 1], [8, 13, 8, 3], [10, 13, 13, 5], [12, 13, 14, 8]];
+      const cols = ['#2f5a25', '#5f9a3e', '#3f7a30', '#79b24b', '#2f5a25'];
+      blades.forEach((b, i) => {
+        ctx.strokeStyle = cols[i]; ctx.lineWidth = 1.6;
+        ctx.beginPath(); ctx.moveTo(b[0], b[1]); ctx.lineTo(b[2], b[3]); ctx.stroke();
+      });
+    });
+
+    // Цветок (белый, красится tint-ом)
+    this.mk('flower', 10, 10, (ctx) => {
+      ctx.fillStyle = '#ffffff';
+      [[5, 2], [8, 5], [5, 8], [2, 5]].forEach((p) => { ctx.beginPath(); ctx.arc(p[0], p[1], 1.7, 0, 7); ctx.fill(); });
+      ctx.fillStyle = '#f2d36b'; ctx.beginPath(); ctx.arc(5, 5, 1.5, 0, 7); ctx.fill();
+    });
+
+    // Тень под персонажами
+    this.mk('shadow', 40, 16, (ctx) => softShadow(ctx, 20, 8, 18, 6, 0.45));
+
+    // Затемнение по краям экрана
+    this.mk('vig', 256, 256, (ctx) => {
+      const g = ctx.createRadialGradient(128, 128, 60, 128, 128, 182);
+      g.addColorStop(0, 'rgba(8,14,6,0)'); g.addColorStop(1, 'rgba(8,14,6,0.62)');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, 256, 256);
+    });
+
+    // Персонажи
+    const person = (key, jacket) => this.mk(key, 36, 44, (ctx) => {
+      // ноги и ботинки
+      ctx.fillStyle = '#2a3452'; ctx.fillRect(12, 30, 5, 9); ctx.fillRect(19, 30, 5, 9);
+      ctx.fillStyle = '#1b1b1f'; ctx.fillRect(11, 38, 7, 4); ctx.fillRect(18, 38, 7, 4);
+      // рюкзак сбоку
+      ctx.fillStyle = '#7a5a34'; ctx.fillRect(25, 19, 6, 11);
+      ctx.fillStyle = '#5b4125'; ctx.fillRect(25, 26, 6, 4);
+      // руки
+      ctx.fillStyle = jacket[2]; ctx.fillRect(6, 19, 5, 11); ctx.fillRect(25, 19, 4, 11);
+      ctx.fillStyle = '#e8b88e'; ctx.fillRect(6, 29, 5, 3); ctx.fillRect(25, 29, 4, 3);
+      // куртка с объёмом (свет слева)
+      const gr = ctx.createLinearGradient(10, 0, 26, 0);
+      gr.addColorStop(0, jacket[0]); gr.addColorStop(0.55, jacket[1]); gr.addColorStop(1, jacket[2]);
+      ctx.fillStyle = gr; ctx.fillRect(10, 16, 16, 16);
+      ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fillRect(10, 29, 16, 3);
+      // голова
+      sphere(ctx, 18, 11, 8, ['#ffe6c8', '#f0c39a', '#c98f66']);
+      // волосы
+      ctx.fillStyle = '#4a3322';
+      ctx.beginPath(); ctx.arc(18, 10, 8.4, Math.PI * 1.02, Math.PI * 1.98); ctx.closePath(); ctx.fill();
+      // глаза
+      ctx.fillStyle = '#2a1e18'; ctx.fillRect(14, 12, 2, 2); ctx.fillRect(20, 12, 2, 2);
+    });
+    person('player',  ['#6b9be0', '#3d6fb5', '#274a80']);
+    person('player2', ['#e07a5a', '#c2553a', '#8a3622']);
+
+    // Деревья (два оттенка)
+    const tree = (key, back, mid, top) => this.mk(key, 56, 78, (ctx) => {
+      softShadow(ctx, 33, 70, 24, 8, 0.4);
+      // ствол с объёмом
+      const gr = ctx.createLinearGradient(22, 0, 36, 0);
+      gr.addColorStop(0, '#a77746'); gr.addColorStop(1, '#4e2f19');
+      poly(ctx, [[25, 42], [33, 42], [36, 70], [22, 70]], gr);
+      ctx.fillStyle = 'rgba(0,0,0,0.18)'; ctx.fillRect(25, 46, 8, 5);
+      // крона из шаров
+      sphere(ctx, 20, 38, 15, back);
+      sphere(ctx, 37, 36, 15, back);
+      sphere(ctx, 28, 26, 18, mid);
+      sphere(ctx, 23, 20, 11, top);
+      // фактура листвы
+      for (let i = 0; i < 22; i++) {
+        ctx.fillStyle = Math.random() < 0.5 ? 'rgba(255,255,255,0.13)' : 'rgba(0,0,0,0.10)';
+        ctx.beginPath(); ctx.arc(rnd(10, 46), rnd(12, 46), rnd(1, 2), 0, 7); ctx.fill();
+      }
+    });
+    tree('tree1', ['#5aa043', '#357a30', '#1f5224'], ['#7cc356', '#46903a', '#245a2a'], ['#9ad66a', '#5aa845', '#2f6e30']);
+    tree('tree2', ['#7aa63a', '#4d7c28', '#2c4f1a'], ['#a5c94c', '#6a9a33', '#3a6020'], ['#c4e06a', '#82b040', '#4a7228']);
+
+    // Камни (две формы)
+    const rock = (key, pts, top, side) => this.mk(key, 48, 38, (ctx) => {
+      softShadow(ctx, 28, 32, 22, 6, 0.42);
+      const gr = ctx.createLinearGradient(8, 6, 42, 34);
+      gr.addColorStop(0, '#c0c8d0'); gr.addColorStop(0.5, '#808892'); gr.addColorStop(1, '#4a515a');
+      poly(ctx, pts, gr);
+      poly(ctx, top, 'rgba(255,255,255,0.28)');
+      poly(ctx, side, 'rgba(0,0,0,0.24)');
+      ctx.strokeStyle = 'rgba(30,35,40,0.35)'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(20, 12); ctx.lineTo(24, 22); ctx.lineTo(21, 28); ctx.stroke();
+      ctx.fillStyle = 'rgba(80,130,60,0.55)';
+      ctx.beginPath(); ctx.ellipse(14, 26, 5, 2.5, 0, 0, 7); ctx.fill();
+    });
+    rock('rock1',
+      [[6, 28], [10, 14], [22, 6], [36, 9], [43, 20], [41, 30], [24, 34]],
+      [[10, 14], [22, 6], [36, 9], [30, 17], [16, 19]],
+      [[30, 17], [36, 9], [43, 20], [41, 30], [32, 26]]);
+    rock('rock2',
+      [[5, 30], [8, 18], [17, 10], [30, 8], [42, 17], [43, 28], [28, 35]],
+      [[8, 18], [17, 10], [30, 8], [26, 17], [14, 21]],
+      [[26, 17], [30, 8], [42, 17], [43, 28], [33, 27]]);
+
+    // Куст с ягодами
+    this.mk('bush1', 44, 36, (ctx) => {
+      softShadow(ctx, 25, 31, 19, 5, 0.36);
+      sphere(ctx, 13, 22, 10, ['#4f9a4a', '#2f7a3a', '#1c5226']);
+      sphere(ctx, 31, 22, 10, ['#4f9a4a', '#2f7a3a', '#1c5226']);
+      sphere(ctx, 22, 17, 13, ['#6dba5a', '#3f8a3c', '#215a2a']);
+      sphere(ctx, 18, 13, 7, ['#8ed26e', '#58a448', '#2f6e30']);
+      [[14, 20], [25, 13], [30, 23], [19, 26], [9, 25], [34, 26], [22, 20]].forEach((p) => {
+        sphere(ctx, p[0], p[1], 2.8, ['#ff8a90', '#d3303f', '#8f1c2a']);
+        ctx.fillStyle = 'rgba(255,255,255,0.8)';
+        ctx.beginPath(); ctx.arc(p[0] - 1, p[1] - 1, 0.8, 0, 7); ctx.fill();
+      });
+    });
+
+    // Иконки в панели ресурсов
+    this.mk('ic_wood', 26, 26, (ctx) => {
+      const gr = ctx.createLinearGradient(0, 8, 0, 20);
+      gr.addColorStop(0, '#b98550'); gr.addColorStop(1, '#6b4423');
+      ctx.fillStyle = gr; ctx.fillRect(4, 8, 16, 11);
+      sphere(ctx, 4, 13.5, 5.5, ['#9a6a3a', '#7a5028', '#4e2f19']);
+      sphere(ctx, 20, 13.5, 5.5, ['#f0cf98', '#d9a968', '#b07c45']);
+      ctx.strokeStyle = '#8a5a2b'; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.arc(20, 13.5, 2.8, 0, 7); ctx.stroke();
+    });
+    this.mk('ic_stone', 26, 26, (ctx) => {
+      const gr = ctx.createLinearGradient(4, 5, 22, 21);
+      gr.addColorStop(0, '#c9d0d8'); gr.addColorStop(1, '#5b626b');
+      poly(ctx, [[3, 19], [6, 9], [14, 5], [22, 10], [22, 19], [12, 22]], gr);
+      poly(ctx, [[6, 9], [14, 5], [22, 10], [14, 13]], 'rgba(255,255,255,0.3)');
+    });
+    this.mk('ic_food', 26, 26, (ctx) => {
+      sphere(ctx, 9, 16, 6, ['#ff8a90', '#d3303f', '#8f1c2a']);
+      sphere(ctx, 17, 14, 6, ['#ff8a90', '#d3303f', '#8f1c2a']);
+      ctx.fillStyle = '#4f9a4a';
+      ctx.beginPath(); ctx.ellipse(13, 6, 5, 2.5, -0.3, 0, 7); ctx.fill();
+    });
+  }
+}
+
+function startGame() {
+  if (NET.started) return;
+  NET.started = true;
+  $('lobby').style.display = 'none';
+  new Phaser.Game({
+    type: Phaser.AUTO,
+    parent: 'game',
+    backgroundColor: '#1a2117',
+    scale: { mode: Phaser.Scale.RESIZE, width: '100%', height: '100%' },
+    physics: { default: 'arcade', arcade: { debug: false } },
+    input: { activePointers: 3 },
+    scene: Main
+  });
+}
+
+document.addEventListener('gesturestart', (e) => e.preventDefault());
+</script>
+</body>
+</html>
