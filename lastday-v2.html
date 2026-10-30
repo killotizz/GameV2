@@ -28,6 +28,7 @@
                 text-align: center; letter-spacing: 6px; text-transform: uppercase; outline: none;
                 -webkit-user-select: text; user-select: text; }
   #status { min-height: 20px; margin-top: 16px; color: #ffd98a; font-size: 14px; line-height: 1.35; }
+  #ver { margin-top: 22px; color: #7d8f6e; font-size: 13px; }
 </style>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/phaser/3.80.1/phaser.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
@@ -44,11 +45,13 @@
     <input id="codeIn" maxlength="5" placeholder="КОД" autocapitalize="characters" autocomplete="off" autocorrect="off" spellcheck="false">
     <button id="btnJoin" class="alt">Войти</button>
     <div id="status"></div>
+    <div id="ver"></div>
   </div>
 </div>
 
 <script>
 // ====== НАСТРОЙКИ ======
+const VERSION = 'v2.1';    // меняй при каждом обновлении: так видно, у кого старая версия
 const WORLD = 2400;
 const SPEED = 190;
 const HIT_COOLDOWN = 380;
@@ -57,19 +60,40 @@ const RESPAWN_MS = 12000;
 const SEND_EVERY = 50;
 const PREFIX = 'lde-surv-';
 
-// tex — список вариантов картинки (выбирается по id), sway — сила покачивания в градусах,
-// body — хитбокс [ширина, высота, смещение x, смещение y]
+// Хитбоксы: [ширина, высота, смещение x, смещение y]
 const TYPES = {
-  tree: { tex: ['tree1', 'tree2'], hp: 4, res: 'wood',  label: 'дерево', count: 55, sway: 1.1, body: [20, 12, 18, 62] },
-  rock: { tex: ['rock1', 'rock2'], hp: 5, res: 'stone', label: 'камень', count: 30, sway: 0,   body: [38, 20, 5, 14] },
-  bush: { tex: ['bush1'],          hp: 3, res: 'food',  label: 'ягоды',  count: 25, sway: 0.7, body: [30, 16, 7, 16] }
+  tree: { tex: ['tree1', 'tree2'], hp: 4, res: 'wood',  label: 'дерево', count: 55, sway: 1.1, tool: 'axe',  body: [20, 12, 18, 62] },
+  rock: { tex: ['rock1', 'rock2'], hp: 5, res: 'stone', label: 'камень', count: 30, sway: 0,   tool: 'pick', body: [38, 20, 5, 14] },
+  bush: { tex: ['bush1'],          hp: 3, res: 'food',  label: 'ягоды',  count: 25, sway: 0.7, tool: null,   body: [30, 16, 7, 16] }
 };
+
+// Рецепты крафта. Правильный инструмент в руке бьёт вдвое сильнее (дерево — топор, камень — кирка).
+const RECIPES = [
+  { id: 'axe',  name: 'Топор', icon: 'ic_axe',  cost: { wood: 3, stone: 2 } },
+  { id: 'pick', name: 'Кирка', icon: 'ic_pick', cost: { wood: 3, stone: 3 } }
+];
+const ITEM_NAMES = { hand: 'Рука', axe: 'Топор', pick: 'Кирка' };
+const RES_NAMES = { wood: 'Дерево', stone: 'Камень', food: 'Ягоды' };
+const HELD_CODE = { hand: 0, axe: 1, pick: 2 };
+const HELD_BY_CODE = ['hand', 'axe', 'pick'];
+const BONUS_DMG = 2;
+
+function newInv() { return { wood: 0, stone: 0, food: 0, axe: 0, pick: 0 }; }
+function canCraft(inv, r) {
+  if (inv[r.id] >= 1) return false;
+  for (const k in r.cost) if (inv[k] < r.cost[k]) return false;
+  return true;
+}
+function costStr(r) {
+  return Object.keys(r.cost).map((k) => RES_NAMES[k] + ' ×' + r.cost[k]).join('   ');
+}
 
 // ====== СЕТЬ (peer-to-peer через PeerJS) ======
 const NET = { mode: null, peer: null, conn: null, code: '', started: false,
               init: null, queue: [], onMsg: null, onJoin: null, onLeave: null, onError: null };
 
 const $ = (id) => document.getElementById(id);
+$('ver').textContent = 'Версия ' + VERSION;
 function setStatus(text, busy) {
   $('status').textContent = text;
   $('btnHost').disabled = !!busy;
@@ -128,7 +152,10 @@ function joinGame() {
       setStatus('Не получилось соединиться. Проверь код и что друг уже создал игру. Иногда помогает сменить Wi-Fi на мобильный интернет или наоборот.', false);
       peer.destroy();
     }, 15000);
-    conn.on('open', () => { NET.conn = conn; NET.peer = peer; NET.mode = 'client'; NET.code = code; });
+    conn.on('open', () => {
+      NET.conn = conn; NET.peer = peer; NET.mode = 'client'; NET.code = code;
+      conn.send({ t: 'hello', v: VERSION });
+    });
     conn.on('data', (d) => {
       if (d.t === 'init' && !NET.started) { clearTimeout(timer); NET.init = d; startGame(); }
       else dispatch(d);
@@ -148,16 +175,12 @@ $('btnHost').addEventListener('click', () => hostGame(0));
 $('btnJoin').addEventListener('click', joinGame);
 
 // ====== РИСОВАНИЕ КАРТИНОК (canvas с градиентами = «объём») ======
-// Источник света — сверху-слева: блики слева-сверху, тени падают вправо-вниз.
-
-// шар с бликом
 function sphere(ctx, cx, cy, r, c) {
   const g = ctx.createRadialGradient(cx - r * 0.35, cy - r * 0.4, r * 0.08, cx, cy, r);
   g.addColorStop(0, c[0]); g.addColorStop(0.55, c[1]); g.addColorStop(1, c[2]);
   ctx.fillStyle = g;
   ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.fill();
 }
-// мягкая тень-эллипс
 function softShadow(ctx, cx, cy, rx, ry, alpha) {
   ctx.save();
   ctx.translate(cx, cy); ctx.scale(1, ry / rx);
@@ -177,6 +200,9 @@ function poly(ctx, pts, fill) {
 }
 function rnd(a, b) { return a + Math.random() * (b - a); }
 
+// Размеры панели рюкзака
+const PW = 340, PH = 332;
+
 class Main extends Phaser.Scene {
   constructor() { super('main'); }
 
@@ -188,12 +214,21 @@ class Main extends Phaser.Scene {
     this.decorate();
     this.physics.world.setBounds(0, 0, WORLD, WORLD);
 
-    // Игрок (клиент появляется чуть в стороне, чтобы не совпасть с хостом)
     const off = this.isClient ? 40 : 0;
     this.player = this.physics.add.sprite(WORLD / 2 + off, WORLD / 2 + off, 'player');
     this.player.setCollideWorldBounds(true);
     this.player.body.setSize(18, 12).setOffset(9, 30);
     this.pShadow = this.add.image(0, 0, 'shadow');
+    this.held = this.add.image(0, 0, 'ic_axe').setScale(0.85).setVisible(false);
+
+    // Состояние игрока
+    this.inv = newInv();
+    this.friendInv = newInv();
+    this.hotbar = ['hand', null, null, null, null];
+    this.sel = 0;
+    this.swingT = 0;
+    this.panelOpen = false;
+    this.rh = 0;
 
     // Ресурсы
     this.solids = this.physics.add.group({ immovable: true, allowGravity: false });
@@ -209,8 +244,6 @@ class Main extends Phaser.Scene {
     this.cameras.main.setBounds(0, 0, WORLD, WORLD);
     this.cameras.main.startFollow(this.player, true, 0.15, 0.15);
 
-    this.inv = { wood: 0, stone: 0, food: 0 };
-    this.friendInv = { wood: 0, stone: 0, food: 0 };
     this.target = null;
     this.nextHit = 0;
     this.nextSend = 0;
@@ -221,6 +254,8 @@ class Main extends Phaser.Scene {
     this.setupControls();
     this.ring = this.add.graphics().setDepth(1);
     this.buildUi();
+    this.buildHotbar();
+    this.buildPanel();
 
     this.layout();
     this.scale.on('resize', this.layout, this);
@@ -233,14 +268,15 @@ class Main extends Phaser.Scene {
     NET.onError = (err) => this.toast('Ошибка сети: ' + err.type);
     NET.queue.splice(0).forEach((d) => this.handle(d));
     if (!this.isClient && NET.conn && NET.conn.open) this.onFriendJoin();
+    if (this.isClient && NET.init.v !== VERSION) {
+      this.toast('У друга версия ' + NET.init.v + ', у тебя ' + VERSION + '.\nОбновите страницу обоим.');
+    }
   }
 
   // ----- интерфейс -----
   buildUi() {
-    // тёмные края экрана (виньетка) — добавляет глубины
     this.vig = this.add.image(0, 0, 'vig').setOrigin(0).setScrollFactor(0).setDepth(99990);
 
-    // панель ресурсов
     this.hudPanel = this.add.graphics().setScrollFactor(0).setDepth(99999);
     this.hudPanel.fillStyle(0x0b120a, 0.45).fillRoundedRect(10, 10, 132, 98, 14);
     this.hudPanel.lineStyle(2, 0xffffff, 0.12).strokeRoundedRect(10, 10, 132, 98, 14);
@@ -259,19 +295,221 @@ class Main extends Phaser.Scene {
       color: '#ffe9a8', stroke: '#1a2117', strokeThickness: 4, lineSpacing: 3
     }).setOrigin(1, 0).setScrollFactor(0).setDepth(100000);
     this.hint = this.add.text(0, 0,
-      'Ходьба: WASD / стрелки или джойстик слева\nДобыча: Пробел / E или кнопка справа',
-      { fontFamily: 'sans-serif', fontSize: '15px', color: '#fff6e0', align: 'center',
-        stroke: '#1a2117', strokeThickness: 4 }
+      'Ходьба: WASD / стрелки или джойстик слева\nДобыча: Пробел / E или кнопка справа\nПредмет в руку: цифры 1-5 или тап по ячейке\nРюкзак и крафт: C или кнопка справа сверху',
+      { fontFamily: 'sans-serif', fontSize: '14px', color: '#fff6e0', align: 'center',
+        stroke: '#1a2117', strokeThickness: 4, lineSpacing: 2 }
     ).setOrigin(0.5, 1).setScrollFactor(0).setDepth(100000);
-    this.tweens.add({ targets: this.hint, alpha: 0, delay: 10000, duration: 1500 });
+    this.tweens.add({ targets: this.hint, alpha: 0, delay: 12000, duration: 1500 });
     this.toastTxt = this.add.text(0, 0, '', {
       fontFamily: 'sans-serif', fontSize: '18px', fontStyle: 'bold', color: '#fff6e0',
       stroke: '#1a2117', strokeThickness: 5, align: 'center'
-    }).setOrigin(0.5, 0).setScrollFactor(0).setDepth(100002).setAlpha(0);
+    }).setOrigin(0.5, 0).setScrollFactor(0).setDepth(100900).setAlpha(0);
+
+    // кнопка рюкзака
+    this.bagBtn = this.add.circle(0, 0, 26, 0x34502c, 0.9)
+      .setStrokeStyle(2, 0x9fd18b, 0.9).setScrollFactor(0).setDepth(100000).setInteractive();
+    this.bagBtn.setData('act', 'bag');
+    this.bagIcon = this.add.image(0, 0, 'ic_bag').setScrollFactor(0).setDepth(100001);
+  }
+
+  buildHotbar() {
+    this.hbSlots = [];
+    for (let i = 0; i < 5; i++) {
+      const bg = this.add.rectangle(0, 0, 52, 52, 0x0b120a, 0.6)
+        .setStrokeStyle(2, 0xffffff, 0.25).setScrollFactor(0).setDepth(100000).setInteractive();
+      bg.setData('act', 'slot'); bg.setData('i', i);
+      const ic = this.add.image(0, 0, 'ic_hand').setScrollFactor(0).setDepth(100001).setVisible(false);
+      const num = this.add.text(0, 0, String(i + 1), {
+        fontFamily: 'sans-serif', fontSize: '12px', fontStyle: 'bold', color: '#c9d4b8',
+        stroke: '#1a2117', strokeThickness: 3
+      }).setScrollFactor(0).setDepth(100001);
+      this.hbSlots.push({ bg: bg, ic: ic, num: num });
+    }
+    this.hbName = this.add.text(0, 0, '', {
+      fontFamily: 'sans-serif', fontSize: '14px', fontStyle: 'bold', color: '#ffe9a8',
+      stroke: '#1a2117', strokeThickness: 4
+    }).setOrigin(0.5, 1).setScrollFactor(0).setDepth(100001);
+  }
+
+  buildPanel() {
+    this.pn = [];
+    this.pnInter = [];
+    const D = 100500;
+    const reg = (o, d) => { o.setScrollFactor(0).setDepth(D + d).setVisible(false); this.pn.push(o); return o; };
+    const txt = (size, color, extra) => Object.assign({
+      fontFamily: 'sans-serif', fontSize: size + 'px', fontStyle: 'bold',
+      color: color || '#fff6e0', stroke: '#0b120a', strokeThickness: 3
+    }, extra || {});
+
+    this.pDim = reg(this.add.rectangle(0, 0, 4000, 4000, 0x000000, 0.55).setOrigin(0), 0);
+    this.pDim.setData('act', 'dim');
+    this.pBg = reg(this.add.rectangle(0, 0, PW, PH, 0x0f1a0d, 0.97).setOrigin(0).setStrokeStyle(2, 0x5c8a4d, 1), 1);
+    this.pBg.setData('act', 'noop');
+    this.pTitle = reg(this.add.text(0, 0, 'Рюкзак', txt(22)).setOrigin(0.5, 0), 2);
+    this.pClose = reg(this.add.rectangle(0, 0, 38, 38, 0x34502c, 1).setStrokeStyle(2, 0x5c8a4d, 1), 2);
+    this.pClose.setData('act', 'close');
+    this.pCloseTx = reg(this.add.text(0, 0, '×', txt(30)).setOrigin(0.5), 3);
+
+    this.pItems = [];
+    [['wood', 'ic_wood', 'Дерево'], ['stone', 'ic_stone', 'Камень'], ['food', 'ic_food', 'Ягоды'],
+     ['axe', 'ic_axe', 'Топор'], ['pick', 'ic_pick', 'Кирка']].forEach((d) => {
+      const ic = reg(this.add.image(0, 0, d[1]).setScale(1.25), 2);
+      const tx = reg(this.add.text(0, 0, '0\n' + d[2], txt(14, '#fff6e0', { align: 'center', lineSpacing: 2 })).setOrigin(0.5, 0), 2);
+      this.pItems.push({ key: d[0], name: d[2], ic: ic, tx: tx });
+    });
+
+    this.pDivider = reg(this.add.rectangle(0, 0, PW - 24, 2, 0x5c8a4d, 0.6).setOrigin(0), 2);
+    this.pCraftTitle = reg(this.add.text(0, 0, 'Крафт', txt(18, '#ffe9a8')).setOrigin(0, 0), 2);
+
+    this.pRows = RECIPES.map((r) => {
+      const ic = reg(this.add.image(0, 0, r.icon).setScale(1.4), 2);
+      const name = reg(this.add.text(0, 0, r.name, txt(17)).setOrigin(0, 0), 2);
+      const cost = reg(this.add.text(0, 0, costStr(r), txt(14, '#c9d4b8')).setOrigin(0, 0), 2);
+      const btn = reg(this.add.rectangle(0, 0, 100, 40, 0xe8a33d, 1).setStrokeStyle(2, 0xffe2a8, 1), 2);
+      btn.setData('act', 'craft'); btn.setData('rid', r.id);
+      const btnTx = reg(this.add.text(0, 0, 'Создать', txt(15, '#2a1c05', { strokeThickness: 0 })).setOrigin(0.5), 3);
+      return { r: r, ic: ic, name: name, cost: cost, btn: btn, btnTx: btnTx };
+    });
+
+    this.pFoot = reg(this.add.text(0, 0,
+      'Чтобы инструмент работал, возьми его в руку (ячейки внизу). Топор рубит деревья вдвое быстрее, кирка — камни.',
+      txt(12, '#9fb58f', { align: 'center', fontStyle: 'normal', wordWrap: { width: PW - 28 } })).setOrigin(0.5, 0), 2);
+
+    this.pnInter = [this.pDim, this.pBg, this.pClose, this.pRows[0].btn, this.pRows[1].btn];
+
+    // единый обработчик нажатий на интерфейс
+    this.input.on('gameobjectdown', (pointer, obj) => {
+      const act = obj.getData ? obj.getData('act') : null;
+      if (!act) return;
+      if (act === 'slot') this.select(obj.getData('i'));
+      else if (act === 'bag') this.togglePanel();
+      else if (act === 'close' || act === 'dim') this.closePanel();
+      else if (act === 'craft') this.craft(obj.getData('rid'));
+    });
+  }
+
+  placePanel() {
+    const w = this.scale.width, h = this.scale.height;
+    const px = Math.round((w - PW) / 2), py = Math.max(8, Math.round((h - PH) / 2) - 6);
+    this.pBg.setPosition(px, py);
+    this.pTitle.setPosition(px + PW / 2, py + 12);
+    this.pClose.setPosition(px + PW - 30, py + 28);
+    this.pCloseTx.setPosition(px + PW - 30, py + 27);
+    this.pItems.forEach((it, i) => {
+      it.ic.setPosition(px + 34 + i * 68, py + 62);
+      it.tx.setPosition(px + 34 + i * 68, py + 84);
+    });
+    this.pDivider.setPosition(px + 12, py + 128);
+    this.pCraftTitle.setPosition(px + 16, py + 136);
+    this.pRows.forEach((r, i) => {
+      const y0 = py + 166 + i * 64;
+      r.ic.setPosition(px + 36, y0 + 26);
+      r.name.setPosition(px + 70, y0 + 4);
+      r.cost.setPosition(px + 70, y0 + 28);
+      r.btn.setPosition(px + PW - 62, y0 + 26);
+      r.btnTx.setPosition(px + PW - 62, y0 + 26);
+    });
+    this.pFoot.setPosition(px + PW / 2, py + 296);
+  }
+
+  openPanel() {
+    this.panelOpen = true;
+    this.placePanel();
+    this.pn.forEach((o) => o.setVisible(true));
+    this.pnInter.forEach((o) => o.setInteractive());
+    this.refreshPanel();
+  }
+
+  closePanel() {
+    this.panelOpen = false;
+    this.pn.forEach((o) => o.setVisible(false));
+    this.pnInter.forEach((o) => o.disableInteractive());
+  }
+
+  togglePanel() {
+    if (this.panelOpen) this.closePanel(); else this.openPanel();
+  }
+
+  refreshPanel() {
+    if (!this.panelOpen) return;
+    this.pItems.forEach((it) => {
+      const v = this.inv[it.key];
+      const isTool = it.key === 'axe' || it.key === 'pick';
+      it.tx.setText((isTool ? (v > 0 ? 'есть' : 'нет') : String(v)) + '\n' + it.name);
+      it.ic.setAlpha(isTool && v < 1 ? 0.35 : 1);
+    });
+    this.pRows.forEach((row) => {
+      const have = this.inv[row.r.id] >= 1;
+      const ok = canCraft(this.inv, row.r);
+      row.btn.setFillStyle(have ? 0x34502c : (ok ? 0xe8a33d : 0x4a4f45), 1);
+      row.btnTx.setText(have ? 'Есть' : 'Создать').setColor(have ? '#9fd18b' : (ok ? '#2a1c05' : '#9aa092'));
+      row.cost.setColor(ok || have ? '#c9d4b8' : '#e08a7a');
+    });
+  }
+
+  // ----- хотбар -----
+  heldName() { return this.hotbar[this.sel] || 'hand'; }
+
+  select(i) {
+    if (i < 0 || i > 4 || !this.hotbar[i]) return;
+    this.sel = i;
+    this.refreshHotbar();
+  }
+
+  syncHotbar() {
+    ['axe', 'pick'].forEach((t) => {
+      const idx = this.hotbar.indexOf(t);
+      if (this.inv[t] > 0 && idx < 0) {
+        const f = this.hotbar.indexOf(null);
+        if (f >= 0) { this.hotbar[f] = t; this.sel = f; }
+      } else if (this.inv[t] < 1 && idx >= 0) {
+        this.hotbar[idx] = null;
+        if (this.sel === idx) this.sel = 0;
+      }
+    });
+    this.refreshHotbar();
+  }
+
+  refreshHotbar() {
+    this.hbSlots.forEach((s, i) => {
+      const item = this.hotbar[i];
+      s.ic.setVisible(!!item);
+      if (item) s.ic.setTexture('ic_' + item);
+      const selected = i === this.sel;
+      s.bg.setFillStyle(selected ? 0x2a3a1f : 0x0b120a, selected ? 0.9 : 0.6);
+      s.bg.setStrokeStyle(selected ? 3 : 2, selected ? 0xffd27a : 0xffffff, selected ? 1 : 0.25);
+    });
+    this.hbName.setText(ITEM_NAMES[this.heldName()]);
+  }
+
+  // ----- крафт -----
+  craft(rid) {
+    const r = RECIPES.find((x) => x.id === rid);
+    if (!r) return;
+    if (this.inv[rid] >= 1) { this.toast(r.name + ' уже есть'); return; }
+    if (!canCraft(this.inv, r)) { this.toast('Не хватает ресурсов'); return; }
+    if (this.isClient) send({ t: 'craft', id: rid });
+    else this.doCraft(rid, 'host');
+  }
+
+  // только хост: проверяет и выполняет крафт (свой или друга)
+  doCraft(rid, who) {
+    const r = RECIPES.find((x) => x.id === rid);
+    if (!r) return;
+    const inv = who === 'host' ? this.inv : this.friendInv;
+    if (!canCraft(inv, r)) return;
+    for (const k in r.cost) inv[k] -= r.cost[k];
+    inv[rid] = 1;
+    if (who === 'host') {
+      this.refreshHud();
+      this.toast(r.name + ' создан!');
+    } else {
+      send({ t: 'inv', inv: this.friendInv, made: r.name });
+    }
   }
 
   setupControls() {
-    this.keys = this.input.keyboard.addKeys('W,A,S,D,E,SPACE,UP,DOWN,LEFT,RIGHT');
+    this.keys = this.input.keyboard.addKeys('W,A,S,D,E,SPACE,UP,DOWN,LEFT,RIGHT,ONE,TWO,THREE,FOUR,FIVE,C,I,Q');
     this.input.addPointer(2);
     this.stick = { active: false, id: null, ox: 0, oy: 0, dx: 0, dy: 0 };
     this.stickBase = this.add.circle(0, 0, 60, 0xffffff, 0.10)
@@ -289,7 +527,7 @@ class Main extends Phaser.Scene {
     this.btn.on('pointerout', release);
 
     this.input.on('pointerdown', (p, over) => {
-      if (this.stick.active || (over && over.length)) return;
+      if (this.panelOpen || this.stick.active || (over && over.length)) return;
       if (p.x > this.scale.width * 0.65) return;
       this.stick.active = true; this.stick.id = p.id;
       this.stick.ox = p.x; this.stick.oy = p.y;
@@ -313,18 +551,30 @@ class Main extends Phaser.Scene {
 
   layout() {
     const w = this.scale.width, h = this.scale.height;
-    this.btn.setPosition(w - 80, h - 105);
-    this.btnTxt.setPosition(w - 80, h - 105);
+    this.btn.setPosition(w - 80, h - 125);
+    this.btnTxt.setPosition(w - 80, h - 125);
     this.netTxt.setPosition(w - 16, 14);
-    this.hint.setPosition(w / 2, h - 16).setWordWrapWidth(w - 40);
-    this.toastTxt.setPosition(w / 2, 70).setWordWrapWidth(w - 40);
+    this.bagBtn.setPosition(w - 40, 112);
+    this.bagIcon.setPosition(w - 40, 112);
+    this.hint.setPosition(w / 2, h - 96).setWordWrapWidth(w - 40);
+    this.toastTxt.setPosition(w / 2, 120).setWordWrapWidth(w - 40);
     this.vig.setDisplaySize(w, h);
+
+    const startX = w / 2 - 142 + 26, y = h - 36;
+    this.hbSlots.forEach((s, i) => {
+      const x = startX + i * 58;
+      s.bg.setPosition(x, y); s.ic.setPosition(x, y); s.num.setPosition(x - 22, y - 24);
+    });
+    this.hbName.setPosition(w / 2, y - 32);
+    if (this.panelOpen) this.placePanel();
   }
 
   refreshHud() {
     this.hudTxt[0].setText(String(this.inv.wood));
     this.hudTxt[1].setText(String(this.inv.stone));
     this.hudTxt[2].setText(String(this.inv.food));
+    this.syncHotbar();
+    this.refreshPanel();
   }
 
   refreshNetHud() {
@@ -333,16 +583,16 @@ class Main extends Phaser.Scene {
     else if (this.isClient) t = 'Код: ' + NET.code + '\nты в игре друга';
     else if (this.remote || (NET.conn && NET.conn.open)) t = 'Код: ' + NET.code + '\nдруг в игре';
     else t = 'Код: ' + NET.code + '\nждём друга…';
-    this.netTxt.setText(t);
+    this.netTxt.setText(t + '\n' + VERSION);
   }
 
   toast(str) {
     this.toastTxt.setText(str).setAlpha(1);
     this.tweens.killTweensOf(this.toastTxt);
-    this.tweens.add({ targets: this.toastTxt, alpha: 0, delay: 2500, duration: 600 });
+    this.tweens.add({ targets: this.toastTxt, alpha: 0, delay: 2800, duration: 600 });
   }
 
-  // ----- украшение земли: пятна, трава, цветы -----
+  // ----- украшение земли -----
   decorate() {
     const R = Phaser.Math.Between, F = Phaser.Math.FloatBetween;
     const patchTints = [0x2b4a20, 0x2b4a20, 0x7cab46, 0x6e5a38];
@@ -436,21 +686,33 @@ class Main extends Phaser.Scene {
     this.tweens.add({ targets: txt, y: y - 34, alpha: 0, duration: 800, onComplete: () => txt.destroy() });
   }
 
+  // предмет в руке: рисуем рядом с персонажем, при ударе — замах
+  placeHeld(spr, body, item, flipped, swing) {
+    if (!item || item === 'hand') { spr.setVisible(false); return; }
+    const dir = flipped ? -1 : 1;
+    spr.setTexture('ic_' + item).setVisible(true).setFlipX(flipped);
+    spr.setPosition(body.x + dir * 14, body.y + 4).setDepth(body.depth + 1);
+    const a = swing > 0 ? (-60 + (1 - swing) * 105) : 15;
+    spr.setAngle(dir * a);
+  }
+
   // ----- удары -----
   hit() {
     const t = this.target;
     if (!t || !t.active) return;
     this.player.setFlipX(t.x < this.player.x);
+    this.swingT = 160;
     this.tweens.add({ targets: this.player, scaleX: 1.12, scaleY: 0.9, duration: 70, yoyo: true });
     this.shake(t);
     this.burst(t.x, t.y, t.getData('type'));
     const id = t.getData('id');
-    if (this.isClient) send({ t: 'hit', id: id });
-    else this.applyHit(id, 'host');
+    const h = this.heldName();
+    if (this.isClient) send({ t: 'hit', id: id, h: h });
+    else this.applyHit(id, 'host', h);
   }
 
-  // только хост: применяет удар (свой или друга)
-  applyHit(id, who) {
+  // только хост: применяет удар (свой или друга) с учётом инструмента в руке
+  applyHit(id, who, held) {
     const s = this.res[id];
     if (!s || !s.active) return;
     if (who === 'friend' && this.remote) {
@@ -458,18 +720,25 @@ class Main extends Phaser.Scene {
       if (d > REACH * 2.5) return;
     }
     const type = s.getData('type'), cfg = TYPES[type];
-    const hp = s.getData('hp') - 1;
     const inv = who === 'host' ? this.inv : this.friendInv;
-    inv[cfg.res] += 1;
+
+    let h = held || 'hand';
+    if ((h === 'axe' || h === 'pick') && inv[h] < 1) h = 'hand';   // нет такого инструмента — бьём рукой
+    const bonus = cfg.tool && h === cfg.tool;
+    const left = s.getData('hp');
+    const dmg = Math.min(bonus ? BONUS_DMG : 1, left);
+    const hp = left - dmg;
+    inv[cfg.res] += dmg;
 
     const fx = s.x, fy = s.y - s.height / 2;
+    const label = '+' + dmg + ' ' + cfg.label;
     if (who === 'host') {
       this.refreshHud();
-      this.floatText(fx, fy, '+1 ' + cfg.label);
+      this.floatText(fx, fy, label);
     } else {
       this.shake(s);
       this.burst(s.x, s.y, type);
-      send({ t: 'gain', label: cfg.label, x: fx, y: fy, inv: this.friendInv });
+      send({ t: 'gain', txt: label, x: fx, y: fy, inv: this.friendInv });
     }
 
     if (hp <= 0) {
@@ -485,8 +754,12 @@ class Main extends Phaser.Scene {
   // ----- сообщения по сети -----
   handle(d) {
     switch (d.t) {
+      case 'hello':
+        if (d.v !== VERSION) this.toast('У друга версия ' + d.v + ', у тебя ' + VERSION + '.\nОбновите страницу обоим.');
+        break;
       case 'pos': this.onRemotePos(d); break;
-      case 'hit': if (!this.isClient) this.applyHit(d.id, 'friend'); break;
+      case 'hit': if (!this.isClient) this.applyHit(d.id, 'friend', d.h); break;
+      case 'craft': if (!this.isClient) this.doCraft(d.id, 'friend'); break;
       case 'hp': {
         const s = this.res[d.id];
         if (s && d.by !== 'friend') { this.shake(s); this.burst(s.x, s.y, s.getData('type')); }
@@ -501,24 +774,31 @@ class Main extends Phaser.Scene {
       case 'add': this.spawnAt(d.type, d.x, d.y, d.id, d.hp); break;
       case 'gain':
         this.inv = d.inv; this.refreshHud();
-        this.floatText(d.x, d.y, '+1 ' + d.label);
+        this.floatText(d.x, d.y, d.txt);
+        break;
+      case 'inv':
+        this.inv = d.inv; this.refreshHud();
+        if (d.made) this.toast(d.made + ' создан!');
         break;
     }
   }
 
   onFriendJoin() {
-    this.friendInv = { wood: 0, stone: 0, food: 0 };
+    this.friendInv = newInv();
     const list = Object.keys(this.res).map((k) => {
       const s = this.res[k];
       return { id: s.getData('id'), type: s.getData('type'), x: Math.round(s.x), y: Math.round(s.y), hp: s.getData('hp') };
     });
-    send({ t: 'init', res: list });
+    send({ t: 'init', v: VERSION, res: list });
     this.toast('Друг подключился!');
     this.refreshNetHud();
   }
 
   onFriendLeave() {
-    if (this.remote) { this.remote.destroy(); this.rlabel.destroy(); this.rShadow.destroy(); this.remote = null; }
+    if (this.remote) {
+      this.remote.destroy(); this.rlabel.destroy(); this.rShadow.destroy(); this.rHeld.destroy();
+      this.remote = null;
+    }
     if (this.isClient) { this.lost = true; this.toast('Связь с другом потеряна'); }
     else this.toast('Друг вышел');
     this.refreshNetHud();
@@ -528,6 +808,7 @@ class Main extends Phaser.Scene {
     if (!this.remote) {
       this.rShadow = this.add.image(d.x, d.y, 'shadow');
       this.remote = this.add.sprite(d.x, d.y, 'player2');
+      this.rHeld = this.add.image(d.x, d.y, 'ic_axe').setScale(0.85).setVisible(false);
       this.rlabel = this.add.text(d.x, d.y, 'Друг', {
         fontFamily: 'sans-serif', fontSize: '13px', fontStyle: 'bold', color: '#ffd9b0',
         stroke: '#1a2117', strokeThickness: 3
@@ -535,12 +816,29 @@ class Main extends Phaser.Scene {
       this.refreshNetHud();
     }
     this.rtx = d.x; this.rty = d.y;
+    this.rh = d.h || 0;
     this.remote.setFlipX(!!d.f);
   }
 
   // ----- каждый кадр -----
   update(time, delta) {
     const K = this.keys;
+    const JD = Phaser.Input.Keyboard.JustDown;
+
+    // клавиши: предметы в руке и рюкзак
+    if (JD(K.ONE)) this.select(0);
+    if (JD(K.TWO)) this.select(1);
+    if (JD(K.THREE)) this.select(2);
+    if (JD(K.FOUR)) this.select(3);
+    if (JD(K.FIVE)) this.select(4);
+    if (JD(K.Q)) {
+      for (let k = 1; k <= 5; k++) {
+        const i = (this.sel + k) % 5;
+        if (this.hotbar[i]) { this.select(i); break; }
+      }
+    }
+    if (JD(K.C) || JD(K.I)) this.togglePanel();
+
     let vx = 0, vy = 0;
     if (K.A.isDown || K.LEFT.isDown)  vx -= 1;
     if (K.D.isDown || K.RIGHT.isDown) vx += 1;
@@ -554,15 +852,19 @@ class Main extends Phaser.Scene {
     if (vx < -0.1) this.player.setFlipX(true);
     else if (vx > 0.1) this.player.setFlipX(false);
 
-    // «шагающая» покачка и тень
     this.player.angle = len > 0.08 ? Math.sin(time / 80) * 5 : this.player.angle * 0.7;
     this.player.setDepth(this.player.y + 18);
     this.pShadow.setPosition(this.player.x + 3, this.player.y + 18).setDepth(this.player.depth - 1);
 
-    // отправляем свою позицию
+    // предмет в руке
+    this.swingT = Math.max(0, this.swingT - delta);
+    this.placeHeld(this.held, this.player, this.heldName(), this.player.flipX, this.swingT / 160);
+
+    // отправляем свою позицию и что держим в руке
     if (NET.conn && NET.conn.open && time > this.nextSend) {
       this.nextSend = time + SEND_EVERY;
-      send({ t: 'pos', x: Math.round(this.player.x), y: Math.round(this.player.y), f: this.player.flipX ? 1 : 0 });
+      send({ t: 'pos', x: Math.round(this.player.x), y: Math.round(this.player.y),
+             f: this.player.flipX ? 1 : 0, h: HELD_CODE[this.heldName()] });
     }
 
     // плавно двигаем друга
@@ -574,9 +876,10 @@ class Main extends Phaser.Scene {
       this.remote.setDepth(this.remote.y + 18);
       this.rShadow.setPosition(this.remote.x + 3, this.remote.y + 18).setDepth(this.remote.depth - 1);
       this.rlabel.setPosition(this.remote.x, this.remote.y - 26);
+      this.placeHeld(this.rHeld, this.remote, HELD_BY_CODE[this.rh] || 'hand', this.remote.flipX, 0);
     }
 
-    // ресурсы: покачивание, тряска при ударе, поиск ближайшего
+    // ресурсы: покачивание, тряска, ближайший
     let best = null, bestDist = REACH;
     const pc = this.player.body.center;
     this.solids.children.iterate((s) => {
@@ -603,7 +906,7 @@ class Main extends Phaser.Scene {
     }
 
     const want = K.SPACE.isDown || K.E.isDown || this.actionHeld;
-    if (want && time > this.nextHit && !this.lost) {
+    if (want && time > this.nextHit && !this.lost && !this.panelOpen) {
       this.nextHit = time + HIT_COOLDOWN;
       this.hit();
     }
@@ -617,7 +920,6 @@ class Main extends Phaser.Scene {
   }
 
   makeTextures() {
-    // Земля: бесшовная плитка 128x128 с мягкими пятнами и крапинкой
     this.mk('grass', 128, 128, (ctx) => {
       ctx.fillStyle = '#3f6430'; ctx.fillRect(0, 0, 128, 128);
       const blot = (x, y, r, rgb, a) => {
@@ -637,14 +939,12 @@ class Main extends Phaser.Scene {
       }
     });
 
-    // Мягкое пятно (окрашивается tint-ом)
     this.mk('patch', 128, 128, (ctx) => {
       const g = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
       g.addColorStop(0, 'rgba(255,255,255,1)'); g.addColorStop(1, 'rgba(255,255,255,0)');
       ctx.fillStyle = g; ctx.fillRect(0, 0, 128, 128);
     });
 
-    // Пучок травы
     this.mk('tuft', 16, 14, (ctx) => {
       const blades = [[3, 13, 1, 4], [6, 13, 5, 1], [8, 13, 8, 3], [10, 13, 13, 5], [12, 13, 14, 8]];
       const cols = ['#2f5a25', '#5f9a3e', '#3f7a30', '#79b24b', '#2f5a25'];
@@ -654,64 +954,49 @@ class Main extends Phaser.Scene {
       });
     });
 
-    // Цветок (белый, красится tint-ом)
     this.mk('flower', 10, 10, (ctx) => {
       ctx.fillStyle = '#ffffff';
       [[5, 2], [8, 5], [5, 8], [2, 5]].forEach((p) => { ctx.beginPath(); ctx.arc(p[0], p[1], 1.7, 0, 7); ctx.fill(); });
       ctx.fillStyle = '#f2d36b'; ctx.beginPath(); ctx.arc(5, 5, 1.5, 0, 7); ctx.fill();
     });
 
-    // Тень под персонажами
     this.mk('shadow', 40, 16, (ctx) => softShadow(ctx, 20, 8, 18, 6, 0.45));
 
-    // Затемнение по краям экрана
     this.mk('vig', 256, 256, (ctx) => {
       const g = ctx.createRadialGradient(128, 128, 60, 128, 128, 182);
       g.addColorStop(0, 'rgba(8,14,6,0)'); g.addColorStop(1, 'rgba(8,14,6,0.62)');
       ctx.fillStyle = g; ctx.fillRect(0, 0, 256, 256);
     });
 
-    // Персонажи
     const person = (key, jacket) => this.mk(key, 36, 44, (ctx) => {
-      // ноги и ботинки
       ctx.fillStyle = '#2a3452'; ctx.fillRect(12, 30, 5, 9); ctx.fillRect(19, 30, 5, 9);
       ctx.fillStyle = '#1b1b1f'; ctx.fillRect(11, 38, 7, 4); ctx.fillRect(18, 38, 7, 4);
-      // рюкзак сбоку
       ctx.fillStyle = '#7a5a34'; ctx.fillRect(25, 19, 6, 11);
       ctx.fillStyle = '#5b4125'; ctx.fillRect(25, 26, 6, 4);
-      // руки
       ctx.fillStyle = jacket[2]; ctx.fillRect(6, 19, 5, 11); ctx.fillRect(25, 19, 4, 11);
       ctx.fillStyle = '#e8b88e'; ctx.fillRect(6, 29, 5, 3); ctx.fillRect(25, 29, 4, 3);
-      // куртка с объёмом (свет слева)
       const gr = ctx.createLinearGradient(10, 0, 26, 0);
       gr.addColorStop(0, jacket[0]); gr.addColorStop(0.55, jacket[1]); gr.addColorStop(1, jacket[2]);
       ctx.fillStyle = gr; ctx.fillRect(10, 16, 16, 16);
       ctx.fillStyle = 'rgba(0,0,0,0.25)'; ctx.fillRect(10, 29, 16, 3);
-      // голова
       sphere(ctx, 18, 11, 8, ['#ffe6c8', '#f0c39a', '#c98f66']);
-      // волосы
       ctx.fillStyle = '#4a3322';
       ctx.beginPath(); ctx.arc(18, 10, 8.4, Math.PI * 1.02, Math.PI * 1.98); ctx.closePath(); ctx.fill();
-      // глаза
       ctx.fillStyle = '#2a1e18'; ctx.fillRect(14, 12, 2, 2); ctx.fillRect(20, 12, 2, 2);
     });
     person('player',  ['#6b9be0', '#3d6fb5', '#274a80']);
     person('player2', ['#e07a5a', '#c2553a', '#8a3622']);
 
-    // Деревья (два оттенка)
     const tree = (key, back, mid, top) => this.mk(key, 56, 78, (ctx) => {
       softShadow(ctx, 33, 70, 24, 8, 0.4);
-      // ствол с объёмом
       const gr = ctx.createLinearGradient(22, 0, 36, 0);
       gr.addColorStop(0, '#a77746'); gr.addColorStop(1, '#4e2f19');
       poly(ctx, [[25, 42], [33, 42], [36, 70], [22, 70]], gr);
       ctx.fillStyle = 'rgba(0,0,0,0.18)'; ctx.fillRect(25, 46, 8, 5);
-      // крона из шаров
       sphere(ctx, 20, 38, 15, back);
       sphere(ctx, 37, 36, 15, back);
       sphere(ctx, 28, 26, 18, mid);
       sphere(ctx, 23, 20, 11, top);
-      // фактура листвы
       for (let i = 0; i < 22; i++) {
         ctx.fillStyle = Math.random() < 0.5 ? 'rgba(255,255,255,0.13)' : 'rgba(0,0,0,0.10)';
         ctx.beginPath(); ctx.arc(rnd(10, 46), rnd(12, 46), rnd(1, 2), 0, 7); ctx.fill();
@@ -720,7 +1005,6 @@ class Main extends Phaser.Scene {
     tree('tree1', ['#5aa043', '#357a30', '#1f5224'], ['#7cc356', '#46903a', '#245a2a'], ['#9ad66a', '#5aa845', '#2f6e30']);
     tree('tree2', ['#7aa63a', '#4d7c28', '#2c4f1a'], ['#a5c94c', '#6a9a33', '#3a6020'], ['#c4e06a', '#82b040', '#4a7228']);
 
-    // Камни (две формы)
     const rock = (key, pts, top, side) => this.mk(key, 48, 38, (ctx) => {
       softShadow(ctx, 28, 32, 22, 6, 0.42);
       const gr = ctx.createLinearGradient(8, 6, 42, 34);
@@ -742,7 +1026,6 @@ class Main extends Phaser.Scene {
       [[8, 18], [17, 10], [30, 8], [26, 17], [14, 21]],
       [[26, 17], [30, 8], [42, 17], [43, 28], [33, 27]]);
 
-    // Куст с ягодами
     this.mk('bush1', 44, 36, (ctx) => {
       softShadow(ctx, 25, 31, 19, 5, 0.36);
       sphere(ctx, 13, 22, 10, ['#4f9a4a', '#2f7a3a', '#1c5226']);
@@ -756,7 +1039,7 @@ class Main extends Phaser.Scene {
       });
     });
 
-    // Иконки в панели ресурсов
+    // Иконки
     this.mk('ic_wood', 26, 26, (ctx) => {
       const gr = ctx.createLinearGradient(0, 8, 0, 20);
       gr.addColorStop(0, '#b98550'); gr.addColorStop(1, '#6b4423');
@@ -777,6 +1060,44 @@ class Main extends Phaser.Scene {
       sphere(ctx, 17, 14, 6, ['#ff8a90', '#d3303f', '#8f1c2a']);
       ctx.fillStyle = '#4f9a4a';
       ctx.beginPath(); ctx.ellipse(13, 6, 5, 2.5, -0.3, 0, 7); ctx.fill();
+    });
+
+    const handle = (ctx) => {
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = '#6b4423'; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.moveTo(7, 27); ctx.lineTo(20, 10); ctx.stroke();
+      ctx.strokeStyle = '#b98550'; ctx.lineWidth = 1.5;
+      ctx.beginPath(); ctx.moveTo(6, 26); ctx.lineTo(19, 9); ctx.stroke();
+    };
+    this.mk('ic_axe', 32, 32, (ctx) => {
+      handle(ctx);
+      const gr = ctx.createLinearGradient(16, 4, 28, 18);
+      gr.addColorStop(0, '#eef2f6'); gr.addColorStop(1, '#5f6770');
+      poly(ctx, [[15, 7], [24, 2], [30, 10], [26, 19], [20, 14]], gr);
+      poly(ctx, [[15, 7], [24, 2], [22, 9]], 'rgba(255,255,255,0.35)');
+    });
+    this.mk('ic_pick', 32, 32, (ctx) => {
+      handle(ctx);
+      ctx.lineCap = 'round';
+      ctx.strokeStyle = '#4f5760'; ctx.lineWidth = 5.5;
+      ctx.beginPath(); ctx.arc(19, 17, 12, Math.PI * 1.12, Math.PI * 1.78); ctx.stroke();
+      ctx.strokeStyle = '#cdd4dc'; ctx.lineWidth = 2.5;
+      ctx.beginPath(); ctx.arc(19, 16, 12, Math.PI * 1.15, Math.PI * 1.75); ctx.stroke();
+    });
+    this.mk('ic_hand', 32, 32, (ctx) => {
+      const skin = ['#ffe6c8', '#f0c39a', '#c98f66'];
+      sphere(ctx, 16, 18, 9, skin);
+      sphere(ctx, 10, 10, 3.4, skin); sphere(ctx, 16, 8, 3.4, skin); sphere(ctx, 22, 10, 3.4, skin);
+      sphere(ctx, 6, 18, 3.2, skin);
+    });
+    this.mk('ic_bag', 30, 30, (ctx) => {
+      const gr = ctx.createLinearGradient(5, 0, 25, 0);
+      gr.addColorStop(0, '#d49a5a'); gr.addColorStop(1, '#7a4f26');
+      poly(ctx, [[5, 11], [25, 11], [26, 26], [4, 26]], gr);
+      ctx.fillStyle = gr;
+      ctx.beginPath(); ctx.ellipse(15, 11, 10, 6, 0, Math.PI, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = '#5e3b1c'; ctx.fillRect(9, 18, 12, 7);
+      ctx.fillStyle = '#e8c27a'; ctx.fillRect(13, 13, 4, 3);
     });
   }
 }
